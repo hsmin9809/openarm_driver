@@ -1,3 +1,6 @@
+# Notice of Modification
+This repository is a modified version of the original project, [openarm_driver](https://github.com/enactic/openarm_driver.git), which is licensed under the Apache License 2.0.
+
 # OpenArm Driver
 
 A Python library for controlling [OpenArm](https://github.com/enactic/openarm/), using [OpenArm CAN](https://github.com/enactic/openarm_can/).
