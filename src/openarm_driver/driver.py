@@ -162,7 +162,12 @@ class SingleArmDriver:
         """Fetch the torque."""
         return self.fetch_state(refresh=refresh)["qtorque"]
 
-    def send_position(self, position: ArrayLike, velocity: ArrayLike | None = None):
+    def send_position(
+        self,
+        position: ArrayLike,
+        velocity: ArrayLike | None = None,
+        gravity_torque: ArrayLike | None = None,
+    ):
         """Move the arm by sending the position."""
         checked_result = self.safety_checker.check(position, driver=self)
         if not checked_result.is_safe:
@@ -174,6 +179,7 @@ class SingleArmDriver:
         target_pos = np.asarray(position, dtype=float)
         self.last_command = target_pos
         vel = np.zeros(self.num_mit_motors) if velocity is None else np.asarray(velocity[:self.num_mit_motors], dtype=float)
+        tau = np.zeros(self.num_mit_motors) if gravity_torque is None else np.asarray(gravity_torque[:self.num_mit_motors], dtype=float)
 
         self.openarm.get_arm().mit_control_all(
             [
@@ -181,8 +187,8 @@ class SingleArmDriver:
                     self.kps[i],
                     self.kds[i],
                     target_pos[i] + self.joint_offsets[i],
-                    vel[i],   # feedforward velocity
-                    0,
+                    vel[i],
+                    tau[i],
                 )
                 for i in range(self.num_mit_motors)
             ]
