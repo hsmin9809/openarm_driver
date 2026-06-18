@@ -15,7 +15,7 @@
 """Driver for OpenArm."""
 
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import numpy as np
 from numpy.typing import ArrayLike
@@ -29,13 +29,19 @@ from .safety import (
 )
 
 
-def _create_default_checker(arm_side: str, config: Config) -> CompositeChecker:
+def _create_default_checker(arm_side: str, config: Config, control_hz: float) -> CompositeChecker:
     """Create basic checker with joint limits."""
-    joint_limits = config.get_joint_limits(arm_side)
-    delta_limits = config.get_joint_delta_position_limits()
+    raw_limits = config.get_joint_limits(arm_side)
+    offsets = config.get_joint_offsets(arm_side)
+    # raw_limits are in raw motor coordinates; send_position receives logical
+    # (logical = raw - offset), so convert limits to logical space.
+    logical_limits = raw_limits - offsets[:, np.newaxis]
+    # yaml values are in rad/s; convert to rad/step for per-call delta check.
+    vel_limits = config.get_joint_delta_position_limits()
+    delta_limits = np.asarray(vel_limits, dtype=float) / control_hz
     return CompositeChecker(
         [
-            JointPosChecker(joint_limits),
+            JointPosChecker(logical_limits),
             JointDeltaPosChecker(delta_limits),
         ]
     )
@@ -51,6 +57,7 @@ class SingleArmDriver:
         kps: ArrayLike | None = None,
         kds: ArrayLike | None = None,
         safety_checker: Checker | None = None,
+        control_hz: float = 20.0,
     ):
         """Initialize single arm driver.
 
@@ -100,7 +107,7 @@ class SingleArmDriver:
 
         # If no checker provided, create basic joint limit checker only
         self.safety_checker = (
-            _create_default_checker(arm_side, self.config)
+            _create_default_checker(arm_side, self.config, control_hz)
             if safety_checker is None
             else safety_checker
         )
@@ -136,8 +143,9 @@ class SingleArmDriver:
             for m in self._iter_motors()
         )
         qpos, qvel, qtau = zip(*motor_values)
+        raw = np.array(qpos, dtype=float)
         self.latest_state = {
-            "qpos": np.array(qpos, dtype=float) - self.joint_offsets,
+            "qpos": raw - self.joint_offsets,
             "qvel": np.array(qvel, dtype=float),
             "qtorque": np.array(qtau, dtype=float),
         }
@@ -187,7 +195,8 @@ class SingleArmDriver:
                     self.kps[i],
                     self.kds[i],
                     target_pos[i] + self.joint_offsets[i],
-                    vel[i],
+                    # vel[i],
+                    0,
                     tau[i],
                 )
                 for i in range(self.num_mit_motors)
@@ -208,6 +217,7 @@ class SingleArmDriver:
         position: ArrayLike,
         hz: float,
         duration: float,
+        gravity_fn: Callable[[], ArrayLike] | None = None,
     ):
         """Move the arm smoothly by interpolating the trajectory to the final position."""
         num_steps = int(hz * duration)
@@ -219,7 +229,8 @@ class SingleArmDriver:
             np.array([np.array(self.last_command), np.array(position)]),
             num_steps=num_steps,
         ):
-            self.send_position(smoothed_position)
+            tau = gravity_fn() if gravity_fn is not None else None
+            self.send_position(smoothed_position, gravity_torque=tau)
             time.sleep(1.0 / hz)
 
     def move_to_start_position(self):
