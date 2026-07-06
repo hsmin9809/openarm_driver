@@ -195,8 +195,8 @@ class SingleArmDriver:
                     self.kps[i],
                     self.kds[i],
                     target_pos[i] + self.joint_offsets[i],
-                    # vel[i],
-                    0,
+                    vel[i],
+                    # 0,
                     tau[i],
                 )
                 for i in range(self.num_mit_motors)
