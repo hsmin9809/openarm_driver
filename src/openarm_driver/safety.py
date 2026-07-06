@@ -83,22 +83,16 @@ class JointDeltaPosChecker(Checker):
 
         positions = np.asarray(joint_positions, dtype=float)
         delta = positions - driver.last_command
+        clamped = driver.last_command + np.clip(delta, -self.delta_limits, self.delta_limits)
 
-        for i, d in enumerate(delta):
-            if abs(d) > self.delta_limits[i]:
-                return CheckResult(
-                    is_safe=False,
-                    force_stop=True,
-                    message=(
-                        f"Joint {i} delta {d:.4f} exceeds limit {self.delta_limits[i]:.4f}"
-                    ),
-                    check_type="joint_delta",
-                    details={
-                        "joint": i,
-                        "delta": float(d),
-                        "limit": float(self.delta_limits[i]),
-                    },
-                )
+        if not np.allclose(clamped, positions):
+            return CheckResult(
+                is_safe=False,
+                force_stop=False,
+                fixed_joint_positions=clamped,
+                message="Joint delta clamped to limits.",
+                check_type="joint_delta",
+            )
 
         return CheckResult(
             is_safe=True,
