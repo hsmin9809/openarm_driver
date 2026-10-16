@@ -78,6 +78,13 @@ class Config:
         """Get can interface string."""
         return self._config["can_interface"][arm_side]
 
+    def get_can_fd(self) -> bool:
+        """Return the frame mode; preserve CAN FD for existing configurations."""
+        value = self._config.get("can_fd", True)
+        if not isinstance(value, bool):
+            raise ValueError("can_fd must be a YAML boolean (true or false)")
+        return value
+
     def get_motor_types(self) -> list[str]:
         """Get motor type strings."""
         return self._config["motor_config"]["types"]

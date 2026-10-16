@@ -73,7 +73,7 @@ class SingleArmDriver:
         self.config = config if config is not None else get_default_config()
         self.arm_side = arm_side
         self.can_interface = self.config.get_can_interface(self.arm_side)
-        self.openarm = oa.OpenArm(self.can_interface, True)
+        self.openarm = oa.OpenArm(self.can_interface, self.config.get_can_fd())
         self.latest_state = None
         self.started = False
 
