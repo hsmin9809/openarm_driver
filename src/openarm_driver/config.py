@@ -113,6 +113,10 @@ class Config:
         """Get default derivative gains."""
         return np.array(self._config["control_gains"]["kds"])
 
+    def get_velocity_feedforward_config(self) -> dict | None:
+        """Return optional controller-owned velocity torque compensation settings."""
+        return self._config.get("viscous_ff")
+
     def get_start_config(self) -> dict:
         """Get start config."""
         return self._config["start"]

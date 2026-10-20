@@ -175,8 +175,20 @@ class SingleArmDriver:
         position: ArrayLike,
         velocity: ArrayLike | None = None,
         gravity_torque: ArrayLike | None = None,
+        *,
+        velocity_reference: ArrayLike | None = None,
+        velocity_dt: float | None = None,
+        velocity_feedforward: Callable[[np.ndarray], ArrayLike] | None = None,
     ):
-        """Move the arm by sending the position."""
+        """Send a bounded target and optionally derive velocity AFTER position limiting.
+
+        velocity_reference is the measured logical joint position (not a velocity).
+        velocity_feedforward maps the resulting MIT target velocities to extra
+        torque; its caller owns coefficient validation and torque caps.
+        """
+        position = np.asarray(position, dtype=float)
+        if position.shape != self.joint_offsets.shape or not np.all(np.isfinite(position)):
+            raise ValueError("Position must contain one finite value per configured motor")
         checked_result = self.safety_checker.check(position, driver=self)
         if not checked_result.is_safe:
             if checked_result.force_stop:
@@ -185,9 +197,29 @@ class SingleArmDriver:
                 position = checked_result.fixed_joint_positions
 
         target_pos = np.asarray(position, dtype=float)
-        self.last_command = target_pos
         vel = np.zeros(self.num_mit_motors) if velocity is None else np.asarray(velocity[:self.num_mit_motors], dtype=float)
         tau = np.zeros(self.num_mit_motors) if gravity_torque is None else np.asarray(gravity_torque[:self.num_mit_motors], dtype=float)
+        if velocity_reference is not None:
+            reference = np.asarray(velocity_reference, dtype=float)
+            if (reference.shape not in (target_pos.shape, (7,)) or not np.all(np.isfinite(reference))
+                    or not np.all(np.isfinite(target_pos))
+                    or velocity_dt is None or not np.isfinite(velocity_dt) or velocity_dt <= 0):
+                raise ValueError("velocity_reference must match the finite target; velocity_dt must be positive")
+            count = min(len(reference), self.num_mit_motors)
+            vel = vel.copy()
+            vel[:count] = (target_pos[:count] - reference[:count]) / velocity_dt
+        elif velocity_dt is not None or velocity_feedforward is not None:
+            raise ValueError("Derived velocity/feedforward requires velocity_reference")
+        ff = np.zeros(self.num_mit_motors)
+        if velocity_feedforward is not None:
+            ff = np.asarray(velocity_feedforward(vel.copy()), dtype=float)
+        if (vel.shape != (self.num_mit_motors,) or tau.shape != vel.shape
+                or ff.shape != vel.shape or not np.all(np.isfinite([vel, tau, ff]))):
+            raise ValueError("MIT velocity and torque must be finite per-motor vectors")
+        command_torque = tau + ff
+        if not np.all(np.isfinite(command_torque)):
+            raise ValueError("Combined torque must be finite")
+        self.last_command = target_pos.copy()
 
         self.openarm.get_arm().mit_control_all(
             [
@@ -197,7 +229,7 @@ class SingleArmDriver:
                     target_pos[i] + self.joint_offsets[i],
                     vel[i],
                     # 0,
-                    tau[i],
+                    command_torque[i],
                 )
                 for i in range(self.num_mit_motors)
             ]
@@ -211,6 +243,13 @@ class SingleArmDriver:
             )
 
         self.set_latest_state(timeout_us=300)
+        return {
+            "position": target_pos.copy(),
+            "velocity": vel.copy(),
+            "base_torque": tau.copy(),
+            "velocity_ff_torque": ff.copy(),
+            "torque": command_torque.copy(),
+        }
 
     def smooth_move(
         self,
