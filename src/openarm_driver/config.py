@@ -117,6 +117,14 @@ class Config:
         """Return optional controller-owned velocity torque compensation settings."""
         return self._config.get("viscous_ff")
 
+    def get_compensation_loop_config(self) -> dict | None:
+        """Controller-owned host compensation loop settings; None keeps Step mode."""
+        return self._config.get("compensation_loop")
+
+    def get_torque_protection_config(self) -> dict | None:
+        """Host PD / arm torque protection; None retains native MIT PD."""
+        return self._config.get("torque_protection")
+
     def get_start_config(self) -> dict:
         """Get start config."""
         return self._config["start"]

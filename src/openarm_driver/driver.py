@@ -71,6 +71,18 @@ class SingleArmDriver:
 
         """
         self.config = config if config is not None else get_default_config()
+        from .torque_protection import TorqueProtection, TorqueProtectionSettings
+        protection = TorqueProtectionSettings.from_mapping(self.config.get_torque_protection_config())
+        self.torque_protection = None
+        if protection is not None:
+            loop = self.config.get_compensation_loop_config()
+            if not isinstance(loop, dict):
+                raise ValueError("torque_protection requires the fast compensation_loop")
+            hz = float(loop.get("hz", 500.0))
+            timeout = float(loop.get("state_timeout_s", .05))
+            if not np.isfinite(hz) or hz <= 0 or not np.isfinite(timeout) or timeout < 1 / hz:
+                raise ValueError("Invalid host PD loop rate or feedback timeout")
+            self.torque_protection = TorqueProtection(protection, hz, timeout)
         self.arm_side = arm_side
         self.can_interface = self.config.get_can_interface(self.arm_side)
         self.openarm = oa.OpenArm(self.can_interface, self.config.get_can_fd())
@@ -124,13 +136,19 @@ class SingleArmDriver:
         self.set_latest_state(timeout_us=500)
         self.openarm.refresh_all()
         self.set_latest_state(timeout_us=500)
-        self._on_start()
+        try:
+            self._on_start()
+        except Exception:
+            self.openarm.disable_all()
+            raise
         self.started = True
 
     def stop(self):
         """Stop the arm."""
-        self._on_stop()
-        self.openarm.disable_all()
+        try:
+            self._on_stop()
+        finally:
+            self.openarm.disable_all()
         self.set_latest_state(timeout_us=1000)
         time.sleep(1)
         self.started = False
@@ -138,10 +156,8 @@ class SingleArmDriver:
     def set_latest_state(self, timeout_us=300):
         """Update the state."""
         self.openarm.recv_all(timeout_us)
-        motor_values = (
-            (m.get_position(), m.get_velocity(), m.get_torque())
-            for m in self._iter_motors()
-        )
+        motors = list(self._iter_motors())
+        motor_values = ((m.get_position(), m.get_velocity(), m.get_torque()) for m in motors)
         qpos, qvel, qtau = zip(*motor_values)
         raw = np.array(qpos, dtype=float)
         self.latest_state = {
@@ -149,6 +165,9 @@ class SingleArmDriver:
             "qvel": np.array(qvel, dtype=float),
             "qtorque": np.array(qtau, dtype=float),
         }
+        if getattr(self, "torque_protection", None) is not None:
+            self.latest_state["temperature_rotor"] = np.array([m.get_state_trotor() for m in motors], dtype=float)
+            self.latest_state["temperature_mos"] = np.array([m.get_state_tmos() for m in motors], dtype=float)
 
     def fetch_state(self, refresh=True) -> dict[str, np.ndarray]:
         """Fetch the state."""
@@ -158,9 +177,28 @@ class SingleArmDriver:
         self.set_latest_state(timeout_us=300)
         return self.latest_state
 
+    def request_feedback(self) -> None:
+        """Request replies when a compensation poll has incomplete feedback."""
+        self.openarm.refresh_all()
+
     def fetch_position(self, refresh=True) -> np.ndarray:
         """Fetch the position."""
         return self.fetch_state(refresh=refresh)["qpos"]
+
+    def get_feedback_status(self) -> dict[str, np.ndarray]:
+        """Freshness of the seven arm axes, from native CAN response counters.
+
+        Read immediately after fetch_state under the caller's I/O lock. Position
+        changes cannot establish freshness: a stationary motor still responds.
+        """
+        arm = self.openarm.get_arm()
+        if not hasattr(arm, "get_link_stats"):
+            raise RuntimeError("compensation_loop requires openarm_can get_link_stats support")
+        stats = [arm.get_link_stats(i) for i in range(7)]
+        return {
+            "responses": np.asarray([s.responses for s in stats], dtype=np.int64),
+            "age_s": np.asarray([s.seconds_since_response() for s in stats], dtype=float),
+        }
 
     def fetch_velocity(self, refresh=True) -> np.ndarray:
         """Fetch the velocity."""
@@ -179,12 +217,18 @@ class SingleArmDriver:
         velocity_reference: ArrayLike | None = None,
         velocity_dt: float | None = None,
         velocity_feedforward: Callable[[np.ndarray], ArrayLike] | None = None,
+        velocity_limits: ArrayLike | None = None,
+        send_gripper: bool = True,
+        protection_state: dict | None = None,
     ):
         """Send a bounded target and optionally derive velocity AFTER position limiting.
 
         velocity_reference is the measured logical joint position (not a velocity).
-        velocity_feedforward maps the resulting MIT target velocities to extra
+        velocity_feedforward maps the resulting target velocities to extra
         torque; its caller owns coefficient validation and torque caps.
+        With torque_protection enabled, arm PD is computed here and the complete
+        bounded torque is sent with MIT kp=kd=0. Otherwise native PD is retained.
+        The returned velocity remains the reference used to compute FF.
         """
         position = np.asarray(position, dtype=float)
         if position.shape != self.joint_offsets.shape or not np.all(np.isfinite(position)):
@@ -210,6 +254,12 @@ class SingleArmDriver:
             vel[:count] = (target_pos[:count] - reference[:count]) / velocity_dt
         elif velocity_dt is not None or velocity_feedforward is not None:
             raise ValueError("Derived velocity/feedforward requires velocity_reference")
+        if velocity_limits is not None:
+            limits = np.asarray(velocity_limits, dtype=float)
+            if limits.shape != (7,) or not np.all(np.isfinite(limits)) or np.any(limits <= 0):
+                raise ValueError("velocity_limits must contain seven finite positive values")
+            vel = vel.copy()
+            vel[:7] = np.clip(vel[:7], -limits, limits)
         ff = np.zeros(self.num_mit_motors)
         if velocity_feedforward is not None:
             ff = np.asarray(velocity_feedforward(vel.copy()), dtype=float)
@@ -219,22 +269,38 @@ class SingleArmDriver:
         command_torque = tau + ff
         if not np.all(np.isfinite(command_torque)):
             raise ValueError("Combined torque must be finite")
+        guard = getattr(self, "torque_protection", None)
+        protection_info = {}
+        if guard is not None:
+            try:
+                raw = self.fetch_state(refresh=False) if protection_state is None else protection_state
+                protection_info = guard.apply(target_pos, self.kps, self.kds, tau, ff,
+                                              raw, self.get_feedback_status())
+                command_torque = command_torque.copy()
+                command_torque[:7] = protection_info["torque"]
+                ff = ff.copy()
+                ff[:7] = protection_info["velocity_ff_torque"]
+            except Exception as exc:
+                guard.fault = exc
+                self.hold_gravity_only()
+                raise
         self.last_command = target_pos.copy()
 
         self.openarm.get_arm().mit_control_all(
             [
                 oa.MITParam(
-                    self.kps[i],
-                    self.kds[i],
+                    0.0 if guard is not None and i < 7 else self.kps[i],
+                    0.0 if guard is not None and i < 7 else self.kds[i],
                     target_pos[i] + self.joint_offsets[i],
-                    vel[i],
-                    # 0,
+                    # Arm velocity feedforward is supplied only through torque.
+                    # Keep kd * (-measured_velocity), remove kd * target_velocity.
+                    0.0 if i < 7 else vel[i],
                     command_torque[i],
                 )
                 for i in range(self.num_mit_motors)
             ]
         )
-        if self.gripper_posforce:
+        if self.gripper_posforce and send_gripper:
             # TODO: Now We should multiply 10 to convert Nm to pu?
             self.openarm.get_gripper().set_position(
                 target_pos[-1] + self.joint_offsets[-1],
@@ -244,12 +310,22 @@ class SingleArmDriver:
 
         self.set_latest_state(timeout_us=300)
         return {
+            **protection_info,
             "position": target_pos.copy(),
             "velocity": vel.copy(),
             "base_torque": tau.copy(),
             "velocity_ff_torque": ff.copy(),
             "torque": command_torque.copy(),
         }
+
+    def hold_gravity_only(self):
+        """One fault fallback command; no stale PD and no motion feedforward."""
+        guard = getattr(self, "torque_protection", None)
+        if guard is None:
+            return
+        # Do not send to the separate POS_FORCE gripper.
+        for i, tau in enumerate(guard.gravity_hold()):
+            self.openarm.get_arm().mit_control_one(i, oa.MITParam(0., 0., 0., 0., float(tau)))
 
     def smooth_move(
         self,
@@ -259,18 +335,32 @@ class SingleArmDriver:
         gravity_fn: Callable[[], ArrayLike] | None = None,
     ):
         """Move the arm smoothly by interpolating the trajectory to the final position."""
+        if not np.isfinite(hz) or hz <= 0 or not np.isfinite(duration) or duration <= 0:
+            raise ValueError("Trajectory hz and duration must be finite and positive")
+        trajectory_hz = hz
+        guard = getattr(self, "torque_protection", None)
+        if guard is not None:
+            # Startup/reset/shutdown also need fast feedback when PD runs on PC.
+            hz = max(hz, guard.hz)
         num_steps = int(hz * duration)
         if num_steps <= 0:
             raise ValueError(
                 f"smooth_move step calc error: hz {hz}, duration: {duration}"
             )
-        for smoothed_position in self._interpolate(
+        next_tick = time.monotonic()
+        gripper_every = max(1, int(np.ceil(hz / trajectory_hz)))
+        for step, smoothed_position in enumerate(self._interpolate(
             np.array([np.array(self.last_command), np.array(position)]),
             num_steps=num_steps,
-        ):
+        )):
             tau = gravity_fn() if gravity_fn is not None else None
-            self.send_position(smoothed_position, gravity_torque=tau)
-            time.sleep(1.0 / hz)
+            self.send_position(smoothed_position, gravity_torque=tau,
+                               send_gripper=step % gripper_every == 0 or step == num_steps - 1)
+            next_tick += 1.0 / hz
+            now = time.monotonic()
+            if next_tick < now:
+                next_tick = now  # Never burst catch-up commands.
+            time.sleep(max(0.0, next_tick - now))
 
     def move_to_start_position(self):
         """Move to start position."""
