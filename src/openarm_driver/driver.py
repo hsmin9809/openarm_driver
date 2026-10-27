@@ -118,7 +118,7 @@ class SingleArmDriver:
         self.kps = self.config.get_default_kps() if kps is None else np.array(kps)
         self.kds = self.config.get_default_kds() if kds is None else np.array(kds)
         logging.getLogger("openarm.driver").info(
-            "Arm PD: motor MIT, dq=0, kps=%s kds=%s; "
+            "Arm PD: motor MIT, dq=target velocity, kps=%s kds=%s; "
             "host torque limits cover compensation only, not total motor torque",
             self.kps[:7].tolist(), self.kds[:7].tolist(),
         )
@@ -232,7 +232,8 @@ class SingleArmDriver:
         velocity_reference is the measured logical joint position (not a velocity).
         velocity_feedforward maps the resulting target velocities to extra
         torque; its caller owns coefficient validation and torque caps.
-        PD always runs in the motor with the configured MIT kp/kd and arm dq=0.
+        PD always runs in the motor with configured MIT kp/kd and dq=vel,
+        including the kd * target_velocity contribution when extra FF is off.
         torque_protection bounds only gravity + FF; it cannot cap native PD or
         total motor torque.
         The returned velocity remains the reference used to compute FF.
@@ -303,9 +304,7 @@ class SingleArmDriver:
                     self.kps[i],
                     self.kds[i],
                     target_pos[i] + self.joint_offsets[i],
-                    # Arm velocity feedforward is supplied only through torque.
-                    # Keep kd * (-measured_velocity), remove kd * target_velocity.
-                    0.0 if i < 7 else vel[i],
+                    vel[i],
                     command_torque[i],
                 )
                 for i in range(self.num_mit_motors)
