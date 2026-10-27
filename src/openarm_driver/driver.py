@@ -265,8 +265,8 @@ class SingleArmDriver:
             count = min(len(reference), self.num_mit_motors)
             vel = vel.copy()
             vel[:count] = (target_pos[:count] - reference[:count]) / velocity_dt
-        elif velocity_dt is not None or velocity_feedforward is not None:
-            raise ValueError("Derived velocity/feedforward requires velocity_reference")
+        elif velocity_dt is not None or (velocity_feedforward is not None and velocity is None):
+            raise ValueError("Velocity feedforward requires explicit velocity or velocity_reference")
         if velocity_limits is not None:
             limits = np.asarray(velocity_limits, dtype=float)
             if limits.shape != (7,) or not np.all(np.isfinite(limits)) or np.any(limits <= 0):
