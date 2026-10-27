@@ -1,7 +1,9 @@
-"""Host PD and bounded torque commands with a leaky overload budget.
+"""Bound host compensation while retaining motor-side MIT PD.
 
 Torque-squared exposure is an I^2t proxy, not a calibrated thermal model.
 All arrays cover the seven arm axes. The POS_FORCE gripper is independent.
+Limits apply only to the MIT torque field (gravity + FF), NOT total motor
+torque. Native PD can exceed these limits, including after FF is removed.
 """
 
 from dataclasses import dataclass
@@ -72,17 +74,17 @@ class TorqueProtection:
         s = self.settings
         return s.absolute_nm - self.limit_reduction * (s.absolute_nm - s.continuous_nm)
 
-    def apply(self, target, kp, kd, gravity, ff, state, feedback, now=None):
+    def apply(self, gravity, ff, state, feedback, now=None):
         if self.fault is not None:
             raise RuntimeError(f"Torque protection fault: {self.fault}") from self.fault
         try:
-            return self._apply(target, kp, kd, gravity, ff, state, feedback,
+            return self._apply(gravity, ff, state, feedback,
                                time.monotonic() if now is None else now)
         except Exception as exc:
             self.fault = exc
             raise
 
-    def _apply(self, target, kp, kd, gravity, ff, state, feedback, now):
+    def _apply(self, gravity, ff, state, feedback, now):
         s = self.settings
         values = {}
         for key in ("qpos", "qvel", "qtorque", "temperature_rotor", "temperature_mos"):
@@ -95,20 +97,19 @@ class TorqueProtection:
         if (ages.shape != (7,) or counts.shape != (7,) or not np.all(np.isfinite(ages))
                 or np.any(ages < 0) or np.any(ages > self.state_timeout_s)
                 or not np.all(np.isfinite(counts)) or np.any(counts <= 0)):
-            raise RuntimeError("Stale/missing feedback for host PD")
-        vectors = [np.asarray(v, dtype=float)[:7] for v in (target, kp, kd, gravity, ff)]
+            raise RuntimeError("Stale/missing feedback for compensation protection")
+        vectors = [np.asarray(v, dtype=float)[:7] for v in (gravity, ff)]
         if any(v.shape != (7,) or not np.all(np.isfinite(v)) for v in vectors):
-            raise ValueError("Host PD requires seven finite command values")
-        target, kp, kd, gravity, ff = vectors
-        if np.any(kp < 0) or np.any(kd < 0):
-            raise ValueError("PD gains must be nonnegative")
+            raise ValueError("Compensation requires seven finite command values")
+        gravity, ff = vectors
         if not np.isfinite(now) or (self.last_time is not None and now < self.last_time):
             raise ValueError("Torque protection clock must be monotonic")
         dt = 0.0 if self.last_time is None else now - self.last_time
 
-        # Integrate the previous held output and reported torque, not an
-        # unattainable unclipped request. New actions and resets do not erase load.
-        ratio = np.maximum(np.abs(self.last_torque), np.abs(values["qtorque"])) / s.continuous_nm
+        # Motor feedback includes native PD. The host compensation command is
+        # not total torque (PD can reinforce or oppose it), so integrate measured
+        # torque only. New actions and resets do not erase accumulated load.
+        ratio = np.abs(values["qtorque"]) / s.continuous_nm
         with np.errstate(over="raise", invalid="raise"):
             charge = np.maximum(ratio ** 2 - 1.0, 0.0) / (s.reference_ratio ** 2 - 1.0)
             cool = np.where(ratio < s.recovery_ratio, s.budget_s / s.recovery_s, 0.0)
@@ -127,21 +128,21 @@ class TorqueProtection:
             # A hot startup must not get a new burst allowance.
             current[:] = np.maximum(current, thermal)
 
-        pd = kp * (target - values["qpos"]) - kd * values["qvel"]
         scaled_ff = ff * (1.0 - self.ff_reduction)
-        requested = pd + gravity + scaled_ff
+        requested = gravity + scaled_ff
         if not np.all(np.isfinite(requested)):
-            raise ValueError("Nonfinite combined host torque")
+            raise ValueError("Nonfinite compensation torque")
         torque = np.clip(requested, -self.limit_nm, self.limit_nm)
         self.last_time = now
         self.last_torque = torque.copy()
         self.last_gravity = gravity.copy()
-        return {"torque": torque, "pd_torque": pd, "velocity_ff_torque": scaled_ff,
-                "requested_total_torque": requested, "torque_limit_nm": self.limit_nm.copy(),
+        return {"torque": torque, "velocity_ff_torque": scaled_ff,
+                "requested_compensation_torque": requested,
+                "compensation_limit_nm": self.limit_nm.copy(),
                 "overload_s": self.load_s.copy(), "ff_scale": 1.0 - self.ff_reduction,
                 "temperature_rotor_c": values["temperature_rotor"].copy(),
                 "temperature_mos_c": values["temperature_mos"].copy(),
-                "torque_saturated": (np.abs(requested) > self.limit_nm).astype(float)}
+                "compensation_saturated": (np.abs(requested) > self.limit_nm).astype(float)}
 
     def gravity_hold(self):
         """Fault fallback: remove motion PD/FF without abruptly removing gravity.

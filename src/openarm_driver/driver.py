@@ -14,6 +14,7 @@
 
 """Driver for OpenArm."""
 
+import logging
 import time
 from collections.abc import Callable, Iterator
 
@@ -81,7 +82,7 @@ class SingleArmDriver:
             hz = float(loop.get("hz", 500.0))
             timeout = float(loop.get("state_timeout_s", .05))
             if not np.isfinite(hz) or hz <= 0 or not np.isfinite(timeout) or timeout < 1 / hz:
-                raise ValueError("Invalid host PD loop rate or feedback timeout")
+                raise ValueError("Invalid compensation loop rate or feedback timeout")
             self.torque_protection = TorqueProtection(protection, hz, timeout)
         self.arm_side = arm_side
         self.can_interface = self.config.get_can_interface(self.arm_side)
@@ -116,6 +117,11 @@ class SingleArmDriver:
         # Use provided gains or defaults from config
         self.kps = self.config.get_default_kps() if kps is None else np.array(kps)
         self.kds = self.config.get_default_kds() if kds is None else np.array(kds)
+        logging.getLogger("openarm.driver").info(
+            "Arm PD: motor MIT, dq=0, kps=%s kds=%s; "
+            "host torque limits cover compensation only, not total motor torque",
+            self.kps[:7].tolist(), self.kds[:7].tolist(),
+        )
 
         # If no checker provided, create basic joint limit checker only
         self.safety_checker = (
@@ -226,13 +232,19 @@ class SingleArmDriver:
         velocity_reference is the measured logical joint position (not a velocity).
         velocity_feedforward maps the resulting target velocities to extra
         torque; its caller owns coefficient validation and torque caps.
-        With torque_protection enabled, arm PD is computed here and the complete
-        bounded torque is sent with MIT kp=kd=0. Otherwise native PD is retained.
+        PD always runs in the motor with the configured MIT kp/kd and arm dq=0.
+        torque_protection bounds only gravity + FF; it cannot cap native PD or
+        total motor torque.
         The returned velocity remains the reference used to compute FF.
         """
         position = np.asarray(position, dtype=float)
         if position.shape != self.joint_offsets.shape or not np.all(np.isfinite(position)):
             raise ValueError("Position must contain one finite value per configured motor")
+        for gains in (self.kps, self.kds):
+            gains = np.asarray(gains, dtype=float)
+            if (gains.shape != self.joint_offsets.shape or not np.all(np.isfinite(gains))
+                    or np.any(gains < 0)):
+                raise ValueError("MIT gains must be finite and nonnegative per motor")
         checked_result = self.safety_checker.check(position, driver=self)
         if not checked_result.is_safe:
             if checked_result.force_stop:
@@ -274,8 +286,7 @@ class SingleArmDriver:
         if guard is not None:
             try:
                 raw = self.fetch_state(refresh=False) if protection_state is None else protection_state
-                protection_info = guard.apply(target_pos, self.kps, self.kds, tau, ff,
-                                              raw, self.get_feedback_status())
+                protection_info = guard.apply(tau, ff, raw, self.get_feedback_status())
                 command_torque = command_torque.copy()
                 command_torque[:7] = protection_info["torque"]
                 ff = ff.copy()
@@ -289,8 +300,8 @@ class SingleArmDriver:
         self.openarm.get_arm().mit_control_all(
             [
                 oa.MITParam(
-                    0.0 if guard is not None and i < 7 else self.kps[i],
-                    0.0 if guard is not None and i < 7 else self.kds[i],
+                    self.kps[i],
+                    self.kds[i],
                     target_pos[i] + self.joint_offsets[i],
                     # Arm velocity feedforward is supplied only through torque.
                     # Keep kd * (-measured_velocity), remove kd * target_velocity.
@@ -340,7 +351,8 @@ class SingleArmDriver:
         trajectory_hz = hz
         guard = getattr(self, "torque_protection", None)
         if guard is not None:
-            # Startup/reset/shutdown also need fast feedback when PD runs on PC.
+            # Keep gravity/protection updates fast during trajectories as well.
+            # PD itself runs inside each motor regardless of this send rate.
             hz = max(hz, guard.hz)
         num_steps = int(hz * duration)
         if num_steps <= 0:

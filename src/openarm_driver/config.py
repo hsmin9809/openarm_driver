@@ -122,7 +122,7 @@ class Config:
         return self._config.get("compensation_loop")
 
     def get_torque_protection_config(self) -> dict | None:
-        """Host PD / arm torque protection; None retains native MIT PD."""
+        """Host compensation limits/load monitor; motor MIT PD is always retained."""
         return self._config.get("torque_protection")
 
     def get_start_config(self) -> dict:
