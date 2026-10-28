@@ -121,6 +121,10 @@ class Config:
         """Controller-owned host compensation loop settings; None keeps Step mode."""
         return self._config.get("compensation_loop")
 
+    def get_inertia_feedforward_config(self) -> dict | None:
+        """Optional controller-owned M(q) * target acceleration compensation."""
+        return self._config.get("inertia_ff")
+
     def get_torque_protection_config(self) -> dict | None:
         """Host compensation limits/load monitor; motor MIT PD is always retained."""
         return self._config.get("torque_protection")
