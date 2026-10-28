@@ -155,6 +155,10 @@ class SingleArmDriver:
             self._on_stop()
         finally:
             self.openarm.disable_all()
+            zeros = np.zeros(7)
+            self._observe_command({"position": zeros, "velocity": zeros,
+                                   "base_torque": zeros, "velocity_ff_torque": zeros,
+                                   "torque": zeros}, mode="disabled")
         self.set_latest_state(timeout_us=1000)
         time.sleep(1)
         self.started = False
@@ -319,7 +323,7 @@ class SingleArmDriver:
             )
 
         self.set_latest_state(timeout_us=300)
-        return {
+        command = {
             **protection_info,
             "position": target_pos.copy(),
             "velocity": vel.copy(),
@@ -327,6 +331,26 @@ class SingleArmDriver:
             "velocity_ff_torque": ff.copy(),
             "torque": command_torque.copy(),
         }
+        self._observe_command(command)
+        return command
+
+    def _observe_command(self, command, mode="mit"):
+        """Optional diagnostics only: use cached state, never request more CAN traffic.
+
+        Covers Step, compensation ticks, HOME and startup/shutdown trajectories.
+        The observer must only enqueue copies; failures cannot interrupt control.
+        """
+        observer = getattr(self, "command_observer", None)
+        if observer is None:
+            return
+        try:
+            feedback = self.get_feedback_status()
+            command = dict(command, kp=self.kps[:7], kd=self.kds[:7], mode=mode)
+            if mode != "mit":
+                command["kp"] = command["kd"] = np.zeros(7)
+            observer(command, self.latest_state, feedback)
+        except Exception:
+            self.observer_errors = getattr(self, "observer_errors", 0) + 1
 
     def hold_gravity_only(self):
         """One fault fallback command; no stale PD and no motion feedforward."""
@@ -334,8 +358,12 @@ class SingleArmDriver:
         if guard is None:
             return
         # Do not send to the separate POS_FORCE gripper.
-        for i, tau in enumerate(guard.gravity_hold()):
+        gravity = np.asarray(guard.gravity_hold(), dtype=float)
+        for i, tau in enumerate(gravity):
             self.openarm.get_arm().mit_control_one(i, oa.MITParam(0., 0., 0., 0., float(tau)))
+        self._observe_command({"position": np.zeros(7), "velocity": np.zeros(7),
+                               "base_torque": gravity, "velocity_ff_torque": np.zeros(7),
+                               "torque": gravity}, mode="fault_hold")
 
     def smooth_move(
         self,
